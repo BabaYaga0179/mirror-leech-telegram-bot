@@ -4,15 +4,12 @@ from asyncio import sleep, gather
 from html import escape
 from requests import utils as rutils
 
-from bot import (
+from ... import (
     intervals,
     aria2,
-    DOWNLOAD_DIR,
     task_dict,
     task_dict_lock,
     LOGGER,
-    DATABASE_URL,
-    config_dict,
     non_queued_up,
     non_queued_dl,
     queued_up,
@@ -20,6 +17,7 @@ from bot import (
     queue_dict_lock,
     same_directory_lock,
 )
+from ...core.config_manager import Config
 from ..common import TaskConfig
 from ..ext_utils.bot_utils import sync_to_async
 from ..ext_utils.db_handler import database
@@ -28,6 +26,7 @@ from ..ext_utils.files_utils import (
     clean_download,
     clean_target,
     join_files,
+    create_recursive_symlink,
 )
 from ..ext_utils.links_utils import is_gdrive_id
 from ..ext_utils.status_utils import get_readable_file_size
@@ -74,8 +73,8 @@ class TaskListener(TaskConfig):
     async def on_download_start(self):
         if (
             self.is_super_chat
-            and config_dict["INCOMPLETE_TASK_NOTIFIER"]
-            and DATABASE_URL
+            and Config.INCOMPLETE_TASK_NOTIFIER
+            and Config.DATABASE_URL
         ):
             await database.add_incomplete_task(
                 self.message.chat.id, self.message.link, self.tag
@@ -107,7 +106,9 @@ class TaskListener(TaskConfig):
                                 des_id = list(self.same_dir[self.folder_name]["tasks"])[
                                     0
                                 ]
-                                des_path = f"{DOWNLOAD_DIR}{des_id}{self.folder_name}"
+                                des_path = (
+                                    f"{Config.DOWNLOAD_DIR}{des_id}{self.folder_name}"
+                                )
                                 await makedirs(des_path, exist_ok=True)
                                 LOGGER.info(f"Moving files from {self.mid} to {des_id}")
                                 for item in await listdir(spath):
@@ -132,18 +133,17 @@ class TaskListener(TaskConfig):
         if not (self.is_torrent or self.is_qbit):
             self.seed = False
 
-        unwanted_files = []
-        unwanted_files_size = []
-        files_to_delete = []
-
         if multi_links:
+            self.seed = False
             await self.on_upload_error(
                 f"{self.name} Downloaded!\n\nWaiting for other tasks to finish..."
             )
             return
+        elif self.same_dir:
+            self.seed = False
 
         if self.folder_name:
-            self.name = self.folder_name.split("/")[-1]
+            self.name = self.folder_name.strip("/")
 
         if not await aiopath.exists(f"{self.dir}/{self.name}"):
             try:
@@ -155,69 +155,126 @@ class TaskListener(TaskConfig):
                 await self.on_upload_error(str(e))
                 return
 
-        up_path = f"{self.dir}/{self.name}"
-        self.size = await get_path_size(up_path)
-        if not config_dict["QUEUE_ALL"]:
+        dl_path = f"{self.dir}/{self.name}"
+        self.size = await get_path_size(dl_path)
+        self.is_file = await aiopath.isfile(dl_path)
+
+        if self.seed:
+            self.up_dir = f"{self.dir}10000"
+            up_path = f"{self.up_dir}/{self.name}"
+            await create_recursive_symlink(self.dir, self.up_dir)
+            LOGGER.info(f"Shortcut created: {dl_path} -> {up_path}")
+        else:
+            up_path = dl_path
+
+        if not Config.QUEUE_ALL:
             async with queue_dict_lock:
                 if self.mid in non_queued_dl:
                     non_queued_dl.remove(self.mid)
             await start_from_queued()
 
-        if self.join and await aiopath.isdir(up_path):
+        if self.join and not self.is_file:
             await join_files(up_path)
 
         if self.extract and not self.is_nzb:
             up_path = await self.proceed_extract(up_path, gid)
             if self.is_cancelled:
                 return
+            self.is_file = await aiopath.isfile(up_path)
             up_dir, self.name = up_path.rsplit("/", 1)
             self.size = await get_path_size(up_dir)
+            self.subname = ""
+            self.subsize = 0
+            self.files_to_proceed = []
+            self.proceed_count = 0
+            self.progress = True
+
+        if self.ffmpeg_cmds:
+            up_path = await self.proceed_ffmpeg(
+                up_path,
+                gid,
+            )
+            if self.is_cancelled:
+                return
+            self.is_file = await aiopath.isfile(up_path)
+            up_dir, self.name = up_path.rsplit("/", 1)
+            self.size = await get_path_size(up_dir)
+            self.subname = ""
+            self.subsize = 0
+            self.files_to_proceed = []
+            self.proceed_count = 0
+            self.progress = True
 
         if self.name_sub:
             up_path = await self.substitute(up_path)
             if self.is_cancelled:
                 return
+            self.is_file = await aiopath.isfile(up_path)
             self.name = up_path.rsplit("/", 1)[1]
 
         if self.screen_shots:
             up_path = await self.generate_screenshots(up_path)
             if self.is_cancelled:
                 return
+            self.is_file = await aiopath.isfile(up_path)
             up_dir, self.name = up_path.rsplit("/", 1)
             self.size = await get_path_size(up_dir)
 
         if self.convert_audio or self.convert_video:
             up_path = await self.convert_media(
-                up_path, gid, unwanted_files, unwanted_files_size, files_to_delete
+                up_path,
+                gid,
             )
             if self.is_cancelled:
                 return
+            self.is_file = await aiopath.isfile(up_path)
             up_dir, self.name = up_path.rsplit("/", 1)
             self.size = await get_path_size(up_dir)
+            self.subname = ""
+            self.subsize = 0
+            self.files_to_proceed = []
+            self.proceed_count = 0
+            self.progress = True
 
         if self.sample_video:
-            up_path = await self.generate_sample_video(
-                up_path, gid, unwanted_files, files_to_delete
-            )
+            up_path = await self.generate_sample_video(up_path, gid)
             if self.is_cancelled:
                 return
+            self.is_file = await aiopath.isfile(up_path)
             up_dir, self.name = up_path.rsplit("/", 1)
             self.size = await get_path_size(up_dir)
+            self.subname = ""
+            self.subsize = 0
+            self.files_to_proceed = []
+            self.proceed_count = 0
+            self.progress = True
 
         if self.compress:
             up_path = await self.proceed_compress(
-                up_path, gid, unwanted_files, files_to_delete
+                up_path,
+                gid,
             )
+            self.is_file = await aiopath.isfile(up_path)
             if self.is_cancelled:
                 return
+            self.subname = ""
+            self.subsize = 0
+            self.files_to_proceed = []
+            self.proceed_count = 0
+            self.progress = True
 
         up_dir, self.name = up_path.rsplit("/", 1)
         self.size = await get_path_size(up_dir)
 
         if self.is_leech and not self.compress:
-            await self.proceed_split(up_dir, unwanted_files_size, unwanted_files, gid)
+            await self.proceed_split(up_path, gid)
             if self.is_cancelled:
                 return
+            self.subname = ""
+            self.subsize = 0
+            self.files_to_proceed = []
+            self.proceed_count = 0
+            self.progress = True
 
         add_to_queue, event = await check_running_tasks(self, "up")
         await start_from_queued()
@@ -228,13 +285,9 @@ class TaskListener(TaskConfig):
             await event.wait()
             if self.is_cancelled:
                 return
-            async with queue_dict_lock:
-                non_queued_up.add(self.mid)
             LOGGER.info(f"Start from Queued/Upload: {self.name}")
 
         self.size = await get_path_size(up_dir)
-        for s in unwanted_files_size:
-            self.size -= s
 
         if self.is_leech:
             LOGGER.info(f"Leech Name: {self.name}")
@@ -243,7 +296,7 @@ class TaskListener(TaskConfig):
                 task_dict[self.mid] = TelegramStatus(self, tg, gid, "up")
             await gather(
                 update_status_message(self.message.chat.id),
-                tg.upload(unwanted_files, files_to_delete),
+                tg.upload(),
             )
         elif is_gdrive_id(self.up_dest):
             LOGGER.info(f"Gdrive Upload Name: {self.name}")
@@ -252,7 +305,7 @@ class TaskListener(TaskConfig):
                 task_dict[self.mid] = GoogleDriveStatus(self, drive, gid, "up")
             await gather(
                 update_status_message(self.message.chat.id),
-                sync_to_async(drive.upload, unwanted_files, files_to_delete),
+                sync_to_async(drive.upload),
             )
         else:
             LOGGER.info(f"Rclone Upload Name: {self.name}")
@@ -261,16 +314,16 @@ class TaskListener(TaskConfig):
                 task_dict[self.mid] = RcloneStatus(self, RCTransfer, gid, "up")
             await gather(
                 update_status_message(self.message.chat.id),
-                RCTransfer.upload(up_path, unwanted_files, files_to_delete),
+                RCTransfer.upload(up_path),
             )
 
     async def on_upload_complete(
-        self, link, files, folders, mime_type, rclonePath="", dir_id=""
+        self, link, files, folders, mime_type, rclone_path="", dir_id=""
     ):
         if (
             self.is_super_chat
-            and config_dict["INCOMPLETE_TASK_NOTIFIER"]
-            and DATABASE_URL
+            and Config.INCOMPLETE_TASK_NOTIFIER
+            and Config.DATABASE_URL
         ):
             await database.rm_complete_task(self.message.link)
         msg = f"<b>Name: </b><code>{escape(self.name)}</code>\n\n<b>Size: </b>{get_readable_file_size(self.size)}"
@@ -299,32 +352,28 @@ class TaskListener(TaskConfig):
                 msg += f"\n<b>Files: </b>{files}"
             if (
                 link
-                or rclonePath
-                and config_dict["RCLONE_SERVE_URL"]
+                or rclone_path
+                and Config.RCLONE_SERVE_URL
                 and not self.private_link
             ):
                 buttons = ButtonMaker()
                 if link:
                     buttons.url_button("☁️ Cloud Link", link)
                 else:
-                    msg += f"\n\nPath: <code>{rclonePath}</code>"
-                if (
-                    rclonePath
-                    and (RCLONE_SERVE_URL := config_dict["RCLONE_SERVE_URL"])
-                    and not self.private_link
-                ):
-                    remote, path = rclonePath.split(":", 1)
-                    url_path = rutils.quote(f"{path}")
-                    share_url = f"{RCLONE_SERVE_URL}/{remote}/{url_path}"
+                    msg += f"\n\nPath: <code>{rclone_path}</code>"
+                if rclone_path and Config.RCLONE_SERVE_URL and not self.private_link:
+                    remote, rpath = rclone_path.split(":", 1)
+                    url_path = rutils.quote(f"{rpath}")
+                    share_url = f"{Config.RCLONE_SERVE_URL}/{remote}/{url_path}"
                     if mime_type == "Folder":
                         share_url += "/"
                     buttons.url_button("🔗 Rclone Link", share_url)
-                if not rclonePath and dir_id:
+                if not rclone_path and dir_id:
                     INDEX_URL = ""
                     if self.private_link:
                         INDEX_URL = self.user_dict.get("index_url", "") or ""
-                    elif config_dict["INDEX_URL"]:
-                        INDEX_URL = config_dict["INDEX_URL"]
+                    elif Config.INDEX_URL:
+                        INDEX_URL = Config.INDEX_URL
                     if INDEX_URL:
                         share_url = f"{INDEX_URL}findpath?id={dir_id}"
                         buttons.url_button("⚡ Index Link", share_url)
@@ -333,13 +382,12 @@ class TaskListener(TaskConfig):
                             buttons.url_button("🌐 View Link", share_urls)
                 button = buttons.build_menu(2)
             else:
-                msg += f"\n\nPath: <code>{rclonePath}</code>"
+                msg += f"\n\nPath: <code>{rclone_path}</code>"
                 button = None
             msg += f"\n\n<b>cc: </b>{self.tag}"
             await send_message(self.message, msg, button)
         if self.seed:
-            if self.new_dir:
-                await clean_target(self.new_dir)
+            await clean_target(self.up_dir)
             async with queue_dict_lock:
                 if self.mid in non_queued_up:
                     non_queued_up.remove(self.mid)
@@ -367,7 +415,7 @@ class TaskListener(TaskConfig):
                 del task_dict[self.mid]
             count = len(task_dict)
         await self.remove_from_same_dir()
-        msg = f"{self.tag} Download: {escape(error)}"
+        msg = f"{self.tag} Download: {escape(str(error))}"
         await send_message(self.message, msg, button)
         if count == 0:
             await self.clean()
@@ -376,8 +424,8 @@ class TaskListener(TaskConfig):
 
         if (
             self.is_super_chat
-            and config_dict["INCOMPLETE_TASK_NOTIFIER"]
-            and DATABASE_URL
+            and Config.INCOMPLETE_TASK_NOTIFIER
+            and Config.DATABASE_URL
         ):
             await database.rm_complete_task(self.message.link)
 
@@ -396,8 +444,8 @@ class TaskListener(TaskConfig):
         await start_from_queued()
         await sleep(3)
         await clean_download(self.dir)
-        if self.new_dir:
-            await clean_download(self.new_dir)
+        if self.up_dir:
+            await clean_download(self.up_dir)
         if self.thumb and await aiopath.exists(self.thumb):
             await remove(self.thumb)
 
@@ -406,7 +454,7 @@ class TaskListener(TaskConfig):
             if self.mid in task_dict:
                 del task_dict[self.mid]
             count = len(task_dict)
-        await send_message(self.message, f"{self.tag} {escape(error)}")
+        await send_message(self.message, f"{self.tag} {escape(str(error))}")
         if count == 0:
             await self.clean()
         else:
@@ -414,8 +462,8 @@ class TaskListener(TaskConfig):
 
         if (
             self.is_super_chat
-            and config_dict["INCOMPLETE_TASK_NOTIFIER"]
-            and DATABASE_URL
+            and Config.INCOMPLETE_TASK_NOTIFIER
+            and Config.DATABASE_URL
         ):
             await database.rm_complete_task(self.message.link)
 
@@ -434,7 +482,7 @@ class TaskListener(TaskConfig):
         await start_from_queued()
         await sleep(3)
         await clean_download(self.dir)
-        if self.new_dir:
-            await clean_download(self.new_dir)
+        if self.up_dir:
+            await clean_download(self.up_dir)
         if self.thumb and await aiopath.exists(self.thumb):
             await remove(self.thumb)
